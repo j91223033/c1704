@@ -58,18 +58,6 @@ def find_all_linear_names(model):
             lora_module_names.add(names[0] if len(names) == 1 else names[-1])
     return list(lora_module_names)
 
-def to_one_hot(class_ids_tensor, num_classes=525):
-    # Expand the dimensions of class_ids_tensor to (B, N, 1)
-    expanded_tensor = torch.tensor(class_ids_tensor).unsqueeze(-1)
-
-    # Create a tensor of zeros with the desired shape (B, N, 525)
-    one_hot_tensor = torch.zeros(class_ids_tensor.size(0), class_ids_tensor.size(1), num_classes)
-
-    # Use scatter_ to set the appropriate indices to 1
-    one_hot_tensor.scatter_(-1, expanded_tensor, 1)
-    
-    return torch.tensor(one_hot_tensor)
-
 class LLMAOModel(nn.Module):
     """LoRA for LLaMa model"""
     def __init__(self, **args):
