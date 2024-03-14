@@ -19,6 +19,33 @@ from urllib.parse import urlparse
 import numpy as np
 import csv
 
+def create_mapping(input_dim, output_dim, dropout_rate=0.1):
+    return nn.Sequential(nn.Linear(input_dim, output_dim//4),
+                        nn.ReLU(),
+                        nn.Dropout(dropout_rate),
+                        nn.LayerNorm(output_dim//4),
+                        nn.Linear(output_dim//4, output_dim//2),
+                        nn.ReLU(),
+                        nn.Dropout(dropout_rate),
+                        nn.LayerNorm(output_dim//2),
+                        nn.Linear(output_dim//2, output_dim),
+                        nn.ReLU(),
+                        nn.Dropout(dropout_rate),
+                        nn.LayerNorm(output_dim),
+                        )
+
+def find_all_linear_names(model):
+    cls = torch.nn.Linear
+    lora_module_names = set()
+    #multimodal_keywords = ['mm_projector', 'vision_tower', 'vision_resampler']
+    for name, module in model.named_modules():
+        #if any(mm_keyword in name for mm_keyword in multimodal_keywords):
+        #    continue
+        if isinstance(module, cls):
+            names = name.split('.')
+            lora_module_names.add(names[0] if len(names) == 1 else names[-1])
+    return list(lora_module_names)
+
 def clean_utterance(utterance):
     # Find the position of the first period
     period_pos = utterance.find('.')
