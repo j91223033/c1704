@@ -41,13 +41,13 @@ class LLMAOModel(nn.Module):
         self.stage = args['stage']
         self.max_anchor = 12
         self.max_distractor = 5
-        print('args max_length', args['max_length'])
+        self.visual_hidden_size = 768
 
         imagebind_ckpt_path = os.path.join(self.args['pretrained_ckpt_path'], 'imagebind_ckpt',
                                            self.args['imagebind_version'])
         print(f'Initializing visual encoder from {imagebind_ckpt_path} ...')
-        # TODO
-        self.visual_hidden_size = 768
+
+        # Loading visual encoder from MiKASA
         self.visual_encoder = VisualEncoder()
         checkpoint = torch.load("ckpt/visual_ckpt/best_model.pth")
         # Assuming 'checkpoint' is your loaded checkpoint and 'model' is your current model instance
@@ -127,6 +127,7 @@ class LLMAOModel(nn.Module):
         self.mse_loss = torch.nn.MSELoss()
         self.cos_loss = torch.nn.CosineSimilarity(dim=-1)
 
+    # Adding special tokens
     def _add_pc_token(self):
         # Add an image token for loss masking (and visualization) purposes.
         self.llama_tokenizer.add_tokens(["<PC>"])  # add special image token to tokenizer
@@ -137,23 +138,20 @@ class LLMAOModel(nn.Module):
         self.llama_tokenizer.add_tokens(["<Target>"])  # add special image token to tokenizer
         self.llama_tokenizer.add_tokens(["<Distractor>"])  # add special image token to tokenizer
 
+    # Getting tokens embeddings
     def special_tokens_embed(self, batch_size):
         PC_start = self.llama_tokenizer('<PC>', return_tensors="pt", add_special_tokens=False).to(self.device)
         PC_start = self.llama_model.model.model.embed_tokens(PC_start.input_ids).expand(batch_size, -1, -1)
-        assert PC_start.shape[1] == 1, PC_start.shape[1]
         PC_end = self.llama_tokenizer('</PC>', return_tensors="pt", add_special_tokens=False).to(self.device)
         PC_end = self.llama_model.model.model.embed_tokens(PC_end.input_ids).expand(batch_size, -1, -1)
         Anchor_start = self.llama_tokenizer('<Anchor>', return_tensors="pt", add_special_tokens=False).to(self.device)
         Anchor_start = self.llama_model.model.model.embed_tokens(Anchor_start.input_ids).expand(batch_size, -1, -1)
-        
         Anchor_end = self.llama_tokenizer('</Anchor>', return_tensors="pt", add_special_tokens=False).to(self.device)
         Anchor_end = self.llama_model.model.model.embed_tokens(Anchor_end.input_ids).expand(batch_size, -1, -1)
         Position = self.llama_tokenizer('<Position>', return_tensors="pt", add_special_tokens=False).to(self.device)
-        Position = self.llama_model.model.model.embed_tokens(Position.input_ids).expand(batch_size, -1, -1)
-        
+        Position = self.llama_model.model.model.embed_tokens(Position.input_ids).expand(batch_size, -1, -1)        
         Target = self.llama_tokenizer('<Target>', return_tensors="pt", add_special_tokens=False).to(self.device)
-        Target = self.llama_model.model.model.embed_tokens(Target.input_ids).expand(batch_size, -1, -1)
-        
+        Target = self.llama_model.model.model.embed_tokens(Target.input_ids).expand(batch_size, -1, -1)        
         Distractor = self.llama_tokenizer('<Distractor>', return_tensors="pt", add_special_tokens=False).to(self.device)
         Distractor = self.llama_model.model.model.embed_tokens(Distractor.input_ids).expand(batch_size, -1, -1)
         
@@ -165,6 +163,63 @@ class LLMAOModel(nn.Module):
         Target = self.special_token_proj(Target)
         Distractor = self.special_token_proj(Distractor)
         return PC_start, PC_end, Anchor_start, Anchor_end, Position, Target, Distractor
+
+    # Input encoding and mapping= 
+    def _training_stage_1(self, inputs_from_2_ds):
+        inputs = inputs_from_2_ds["dataset1"]
+        input2 = inputs_from_2_ds["dataset2"]
+        pc_embeds, _ = self.visual_encoder(inputs['objects'], inputs['box_info'])
+        pc_embeds = self.llama_proj(pc_embeds)  # B x (1+max_anchors_n) x llama_size 
+        label_embeds = self.get_label_embed(inputs['instance_label']).detach()
+        object_label_loss = self.get_object_label_loss(pc_embeds, label_embeds)
+        
+        return object_label_loss, 0
+
+    # MLLM tuning
+    def _training_stage_2(self, inputs_from_2_ds):
+        inputs = inputs_from_2_ds["dataset1"]
+        if self.dataset=="sr3d":
+            anchor_ids = inputs['anchor_ids']
+            distractor_ids = inputs['distractor_ids']
+        else:
+            anchor_ids =  select_random_anchors(inputs['object_ids'], inputs['instance_label'], self.max_anchor)
+            distractor_ids = None
+        mm_embeds, mm_mask = self.get_mm_embeds(inputs['objects'], inputs['instance_label'], inputs['box_info'], inputs['target_id'], distractor_ids, anchor_ids, inputs['object_ids'], inputs['objects_color'])
+        
+        input_ids_after_prompt, target_ids, attention_mask = process_batch_stage_2(tokenizer=self.llama_tokenizer,
+                                                                      batch_of_captions=inputs['utterance'],
+                                                                      max_tgt_len=self.max_length,
+                                                                      prompt=self.args['prompt']) # 'generate a caption'        
+        # print(input_ids)
+        inputs_embeds, targets, attention_mask = self.prompt_wrap(mm_embeds, input_ids_after_prompt, target_ids, attention_mask, mm_mask)
+        outputs = self.llama_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            return_dict=True,
+            output_hidden_states=True,
+            labels=targets,
+        )
+        loss = outputs.loss
+        assert not torch.isnan(loss).any(), "loss contains NaN"
+        # calculate the token accuracy
+        chosen_tokens = torch.max(outputs.logits, dim=-1)[1][:, 1:-1]  # [B, S-1]
+        labels = targets[:, 2:]
+        gen_acc = (chosen_tokens.reshape(-1) == labels.reshape(-1)).to(torch.long)  # [B*S]
+        return loss, gen_acc
+    
+    def forward(self, inputs):
+        loss = 0
+        gen_acc = 0
+        mse_loss = None
+
+        if self.stage == 1:
+            loss, gen_acc = self._training_stage_1(inputs)
+        elif self.stage == 2:
+            loss, gen_acc = self._training_stage_2(inputs)
+        else:
+            raise NotImplementedError(f"stage {self.stage} is not implemented, now it only support [1, 2, 3]")
+
+        return loss, gen_acc, mse_loss
             
     def prompt_wrap(self, pc_embeds, ids_after_prompt, target_ids, attention_mask, mm_mask=None, padding=True):
         '''
@@ -209,7 +264,8 @@ class LLMAOModel(nn.Module):
             assert inputs_embeds.size()[1] == targets.size()[1]      
             assert attention_mask.size() == targets.size()
         return inputs_embeds, targets, attention_mask
-    
+
+    # Calculate the relative position and normalize the spatial features
     @torch.no_grad()
     def get_pairwise_distance(self, x):
         #torch.set_printoptions(profile="full")
@@ -224,6 +280,7 @@ class LLMAOModel(nn.Module):
         relative_positions[..., 1] = scale_to_01(relative_positions[..., 1])  
         return relative_positions.to(self.device)
 
+    # Getting the embedding of object labels, which is used to aligned with object features in stage 1
     @torch.no_grad()
     def get_label_embed(self, label, color):
         #print(label)
@@ -250,7 +307,8 @@ class LLMAOModel(nn.Module):
         color = [tensor for sublist in color for tensor in sublist]
         color = torch.stack(color).view(B, N, 3)
         return label_embeds + self.color_enc(color.to(self.device)) # (B, 1+max_anchor, 4096)
-    
+
+    # getting multi modal embedding, which will later feed into the LLM
     def get_mm_embeds(self, objects_pc, instance_label, box_info, target_id, distractor_ids, anchor_ids, object_ids, color):
         """
         objects_pc: (B, N, P, 6)
@@ -424,62 +482,8 @@ class LLMAOModel(nn.Module):
         assert not torch.isnan(cos_loss_value).any(), "cos_loss_value contains NaN"
         print("mse_loss: ", mse_loss_value)
         print("cos_loss: ", cos_loss_value.mean())
-        return mse_w*mse_loss_value + cos_w*cos_loss_value.mean()
-       
-    def _training_stage_1(self, inputs_from_2_ds):
-        inputs = inputs_from_2_ds["dataset1"]
-        input2 = inputs_from_2_ds["dataset2"]
-        pc_embeds, _ = self.visual_encoder(inputs['objects'], inputs['box_info'])
-        pc_embeds = self.llama_proj(pc_embeds)  # B x (1+max_anchors_n) x llama_size 
-        label_embeds = self.get_label_embed(inputs['instance_label']).detach()
-        object_label_loss = self.get_object_label_loss(pc_embeds, label_embeds)
-        
-        return object_label_loss, 0
-    
-    def _training_stage_2(self, inputs_from_2_ds):
-        inputs = inputs_from_2_ds["dataset1"]
-        if self.dataset=="sr3d":
-            anchor_ids = inputs['anchor_ids']
-            distractor_ids = inputs['distractor_ids']
-        else:
-            anchor_ids =  select_random_anchors(inputs['object_ids'], inputs['instance_label'], self.max_anchor)
-            distractor_ids = None
-        mm_embeds, mm_mask = self.get_mm_embeds(inputs['objects'], inputs['instance_label'], inputs['box_info'], inputs['target_id'], distractor_ids, anchor_ids, inputs['object_ids'], inputs['objects_color'])
-        
-        input_ids_after_prompt, target_ids, attention_mask = process_batch_stage_2(tokenizer=self.llama_tokenizer,
-                                                                      batch_of_captions=inputs['utterance'],
-                                                                      max_tgt_len=self.max_length,
-                                                                      prompt=self.args['prompt']) # 'generate a caption'        
-        # print(input_ids)
-        inputs_embeds, targets, attention_mask = self.prompt_wrap(mm_embeds, input_ids_after_prompt, target_ids, attention_mask, mm_mask)
-        outputs = self.llama_model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            return_dict=True,
-            output_hidden_states=True,
-            labels=targets,
-        )
-        loss = outputs.loss
-        assert not torch.isnan(loss).any(), "loss contains NaN"
-        # calculate the token accuracy
-        chosen_tokens = torch.max(outputs.logits, dim=-1)[1][:, 1:-1]  # [B, S-1]
-        labels = targets[:, 2:]
-        gen_acc = (chosen_tokens.reshape(-1) == labels.reshape(-1)).to(torch.long)  # [B*S]
-        return loss, gen_acc
-    
-    def forward(self, inputs):
-        loss = 0
-        gen_acc = 0
-        mse_loss = None
-
-        if self.stage == 1:
-            loss, gen_acc = self._training_stage_1(inputs)
-        elif self.stage == 2:
-            loss, gen_acc = self._training_stage_2(inputs)
-        else:
-            raise NotImplementedError(f"stage {self.stage} is not implemented, now it only support [1, 2, 3]")
-
-        return loss, gen_acc, mse_loss
+        return mse_w*mse_loss_value + cos_w*cos_loss_value.mean()       
+   
 
     def get_random_ids(self, object_ids, instance_labels):
         """
