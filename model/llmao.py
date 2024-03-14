@@ -180,18 +180,6 @@ class LLMAOModel(nn.Module):
         self.llama_tokenizer.add_tokens(["<Target>"])  # add special image token to tokenizer
         self.llama_tokenizer.add_tokens(["<Distractor>"])  # add special image token to tokenizer
 
-        # Add [PC] tokens to the vocabulary.
-        """self.args['gen_pc_token_idx'] = []
-        for i in range(self.args['num_gen_pc_tokens']):
-            print(f'Adding [PC{i}] token to vocabulary.')
-            print(f'Before adding new token, tokenizer("[PC{i}]") =',
-                  self.llama_tokenizer(f'[PC{i}]', add_special_tokens=False))
-            num_added_tokens = self.llama_tokenizer.add_tokens(f'[PC{i}]')
-            print(f'After adding {num_added_tokens} new tokens, tokenizer("[PC{i}]") =',
-                  self.llama_tokenizer(f'[PC{i}]', add_special_tokens=False))
-            gen_token_idx = self.llama_tokenizer(f'[PC{i}]', add_special_tokens=False).input_ids
-            assert len(gen_token_idx) == 1, gen_token_idx
-            self.args['gen_pc_token_idx'].append(gen_token_idx[0])"""
     
     def special_tokens_embed(self, batch_size):
         PC_start = self.llama_tokenizer('<PC>', return_tensors="pt", add_special_tokens=False).to(self.device)
@@ -251,8 +239,7 @@ class LLMAOModel(nn.Module):
                 torch.ones([batch_size, 1 + p_before_embeds.size()[1] + pc_embeds.size()[1]], dtype=torch.long).to(self.device).fill_(-100)
             )  # bsz x (1 + s1 + 1 + max_anchor)            
             atts_prefix = torch.ones([batch_size, 1 + p_before_embeds.size()[1]], dtype=torch.long).to(self.device) # b, 5            
-            atts_prefix = torch.cat([atts_prefix, mm_mask], dim=1) # <PC>, target, <Anchor>, anchors, <Position>, sp, </PC>
-            #atts_prefix = torch.cat([atts_prefix, anchor_masks, anchor_masks], dim=1)        
+            atts_prefix = torch.cat([atts_prefix, mm_mask], dim=1)   
         else: # only text as input
             inputs_embeds = torch.cat([bos_embeds, p_before_embeds, p_after_embeds], dim=1).to(self.device)  # bsz x (1+s1+s2) x embed_dim
             empty_targets = (
@@ -338,10 +325,6 @@ class LLMAOModel(nn.Module):
             target_class = CLASS_LOGITS[b, target_idx].argmax()
             mask = CLASS_LOGITS[b].argmax(dim=-1) == target_class
             same_class_indices = mask.nonzero().squeeze(-1)
-            """values, topk_indices = CLASS_LOGITS[b].topk(3, dim=-1)
-            target_class_tensor = torch.full_like(topk_indices[:, 0], fill_value=target_class)  # shape [N], filled with target_class
-            is_target_class_in_top2 = (topk_indices == target_class_tensor.unsqueeze(-1)).any(dim=-1)  # shape [N], boolean mask
-            same_class_indices = is_target_class_in_top2.nonzero().squeeze(-1)"""
 
             assert target_embed.shape[0]==1 and target_embed.shape[1]==1, target_embed.shape
             # preparing distractor
@@ -443,13 +426,6 @@ class LLMAOModel(nn.Module):
                 anchor_sps_embed = torch.cat([anchor_sps_embed[:,:1],torch.max(anchor_sps_embed, dim=1, keepdim=True)[0]], dim=1)
                 assert anchor_sps_embed.shape[:2] == (1, 2), anchor_sps_embed.shape
                 assert not torch.isnan(anchor_sps_embed).any(), ("anchor_sps_embed contains NaN", anchor_sps)
-                # transformer encoder to encode the spatial features of target & distractors
-                #anchor_sps_embed = self.spatial_self_attn(anchor_sps_embed.transpose(0,1)).transpose(0,1) # (1, 1+len(distractor_objs), D)
-                #assert anchor_sps_embed.shape[:2] == (1, 1+len(distractor_objs)), anchor_sps_embed.shape
-                # Pad all the samples in a batch to the same size
-                #anchor_sps_embed = F.pad(anchor_sps_embed, (0,0,0,self.max_distractor-len(distractor_objs),0,0), 'constant', 0) # (1, 1+max_distractor, D)
-                #assert anchor_sps_embed.shape[:2] == (1, 1+self.max_distractor), anchor_sps_embed.shape
-                # <Anchor, anchor_embeds[j], Position, anchor_sps_embed>
                 assert not torch.isnan(anchor_embeds[:,j:j+1]).any(), "anchor_embeds[:,j:j+1] contains NaN"                
                 anchor_with_token_embed = torch.cat([Anchor_start, anchor_embeds[:,j:j+1], Position, anchor_sps_embed, Anchor_end], dim=1) # (1, 1+1+1+1+1, D)
                 assert anchor_with_token_embed.shape[:2] == (1, 1+1+1+2+1), anchor_with_token_embed.shape
@@ -480,15 +456,9 @@ class LLMAOModel(nn.Module):
         assert not torch.isnan(output_embeds).any(), "output_embeds contains NaN"
         assert output_embeds.shape == (B, 1+1+1+self.max_anchor*(6)+1, self.llama_model.config.hidden_size), output_embeds.shape
         output_mask = torch.cat(output_mask, dim=0)
-        assert output_mask.shape == (B, output_embeds.shape[1]), output_mask.shape
-        assert not torch.isnan(output_mask).any(), "output_mask contains NaN"
         return output_embeds, output_mask
         
     def get_object_label_loss(self, pc_embeds, label_embeds, mse_w=0.5, cos_w=1):
-        assert not torch.isnan(pc_embeds).any(), "pc_embeds contains NaN"
-        assert not torch.isinf(pc_embeds).any(), "pc_embeds contains Inf"
-        assert not torch.isnan(label_embeds).any(), "label_embeds contains NaN"
-        assert not torch.isinf(label_embeds).any(), "label_embeds contains Inf"
         mse_loss_value = self.mse_loss(pc_embeds, label_embeds)
         pc_embeds_normalized = F.normalize(pc_embeds, dim=-1, eps=1e-8)
         label_embeds_normalized = F.normalize(label_embeds, dim=-1, eps=1e-8)
@@ -533,53 +503,6 @@ class LLMAOModel(nn.Module):
             labels=targets,
         )
         loss = outputs.loss
-        assert not torch.isnan(loss).any(), "loss contains NaN"
-        # calculate the token accuracy
-        chosen_tokens = torch.max(outputs.logits, dim=-1)[1][:, 1:-1]  # [B, S-1]
-        labels = targets[:, 2:]
-        gen_acc = (chosen_tokens.reshape(-1) == labels.reshape(-1)).to(torch.long)  # [B*S]
-        valid_mask = (labels != -100).reshape(-1)
-        valid_tokens = gen_acc & valid_mask  # [B*S]
-        gen_acc = valid_tokens.sum().item() / (valid_mask.sum().item() + 1.0)
-        
-        logits = outputs.logits
-        predicted_token_ids = logits.argmax(dim=-1)
-        target_token_ids = targets[0]
-        filtered_tokens = [
-                            self.llama_tokenizer.convert_ids_to_tokens(predicted_token_ids[0][i].item())
-                            for i in range(len(predicted_token_ids[0]))
-                            if target_token_ids[i] != -100
-                        ]
-        predicted_text_filtered = self.llama_tokenizer.convert_tokens_to_string(filtered_tokens)
-        if torch.cuda.current_device() == 0:
-            #print("predicted_ids: ", predicted_token_ids[0])
-            print("predicted_text: ", predicted_text_filtered)
-            target_token_ids = targets[0]  # Select the first batch
-            #print("target_token_ids: ", target_token_ids)
-            target_tokens = [self.llama_tokenizer.convert_ids_to_tokens(token_id.item()) for token_id in target_token_ids if token_id != -100]
-            target_text = self.llama_tokenizer.convert_tokens_to_string(target_tokens)
-            print("Target text: ", target_text)
-            
-        """input_ids, target_ids, attention_mask = process_batch_stage_3(self.llama_tokenizer, input2, self.max_length)
-        inputs_embeds, targets, attention_mask = self.prompt_wrap(None, input_ids, target_ids, attention_mask)
-        outputs = self.llama_model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            return_dict=True,
-            output_hidden_states=True,
-            labels=targets,
-        )
-        logits = outputs.logits
-        predicted_token_ids = logits.argmax(dim=-1)
-        target_token_ids = targets[0]
-        filtered_tokens = [
-                            self.llama_tokenizer.convert_ids_to_tokens(predicted_token_ids[0][i].item())
-                            for i in range(len(predicted_token_ids[0]))
-                            #if target_token_ids[i] != -100
-                        ]
-        predicted_text_filtered = self.llama_tokenizer.convert_tokens_to_string(filtered_tokens)
-        loss += 2*outputs.loss"""
-        #print(GG)
         return loss, gen_acc
     
     def forward(self, inputs):
